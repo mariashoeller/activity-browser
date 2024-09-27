@@ -7,6 +7,8 @@ import bw2calc as bc
 import numpy as np
 import pandas as pd
 from stats_arrays import MCRandomNumberGenerator
+from multiprocessing import Pool, cpu_count, Manager
+import os
 
 from activity_browser.mod import bw2data as bd
 
@@ -14,6 +16,151 @@ from .manager import MonteCarloParameterManager
 
 log = getLogger(__name__)
 
+### helper functions for parallelised MC
+
+def unify_param_exchanges(lca, data: np.ndarray, param_cols) -> np.ndarray:
+    """Convert parameter exchanges from input/output keys to row/col indices."""
+    def key_to_rowcol(x) -> Optional[tuple]:
+        if x["type"] in [0, 1]:
+            row = lca.activity_dict.get(x["input"], None)
+            col = lca.product_dict.get(x["output"], None)
+        else:
+            row = lca.biosphere_dict.get(x["input"], None)
+            col = lca.activity_dict.get(x["output"], None)
+        if row is None or col is None:
+            return None
+        return row, col, x["type"], x["amount"]
+
+    converted = (key_to_rowcol(d) for d in data)
+    unified = np.array(
+        [x for x in converted if x is not None],
+        dtype=[("row", "<u4"), ("col", "<u4"), ("type", "u1"), ("amount", "<f4")],
+    )
+    return unified
+
+def update_vector(vector, params, param_exchanges, param_cols, types):
+    """Update the vector (technosphere or biosphere) with new parameter values."""
+    subset = param_exchanges[np.isin(param_exchanges["type"], types)]
+    idx = np.argwhere(np.isin(params[param_cols], subset[param_cols])).flatten()
+    if len(idx) > 0:
+        uniq = np.unique(params[idx][param_cols])
+        sort_idx = np.searchsorted(uniq, subset[param_cols])
+        vector[idx] = subset[sort_idx]["amount"]
+    return vector
+
+
+### worker function for parallelised MC - needs to be outside the MonteCarloLCA object
+
+def monte_carlo_worker(args):
+    (iterations_chunk,
+     seed,
+     include_technosphere,
+     include_biosphere,
+     include_cfs,
+     include_parameters,
+     func_units_dict,
+     methods,
+     param_cols,
+     progress_queue) = args
+
+    # Unique seed per process
+    process_seed = seed + os.getpid()
+    np.random.seed(process_seed)
+
+    # Initialize LCA object
+    lca = bc.LCA(demand=func_units_dict, method=methods[0])
+    lca.load_data()
+
+    # Initialize random number generators
+    tech_rng = (MCRandomNumberGenerator(lca.tech_params, seed=process_seed)
+                if include_technosphere else lca.tech_params['amount'].copy())
+    bio_rng = (MCRandomNumberGenerator(lca.bio_params, seed=process_seed)
+               if include_biosphere else lca.bio_params['amount'].copy())
+
+    cf_rngs = {}
+    if lca.lcia:
+        for m in methods:
+            lca.switch_method(m)
+            lca.load_lcia_data()
+            cf_rngs[m] = (MCRandomNumberGenerator(lca.cf_params, seed=process_seed)
+                          if include_cfs else lca.cf_params['amount'].copy())
+
+    # Initialize parameter manager if needed
+    if include_parameters:
+        param_rng = MonteCarloParameterManager(seed=process_seed)
+        param_rng.parameters = param_rng.get_new_parameters()
+        parameter_data = param_rng.extract_active_parameters(lca)
+        for k in parameter_data:
+            parameter_data[k]["values"] = []
+
+    # Prepare results
+    num_fu = len(func_units_dict)
+    num_methods = len(methods)
+    results_chunk = np.zeros((iterations_chunk, num_fu, num_methods))
+    A_matrices_chunk = []
+    B_matrices_chunk = []
+    CF_dict_chunk = defaultdict(list)
+    parameter_exchanges_chunk = []
+    parameters_chunk = []
+
+    # Reverse dictionaries
+    lca.activity_dict_rev, lca.product_dict_rev, lca.biosphere_dict_rev = lca.reverse_dict()
+
+    # Prepare indices
+    rev_fu_index = {i: key for i, key in enumerate(func_units_dict)}
+    rev_method_index = {i: m for i, m in enumerate(methods)}
+
+    for iteration in range(iterations_chunk):
+        tech_vector = tech_rng.next() if include_technosphere else tech_rng
+        bio_vector = bio_rng.next() if include_biosphere else bio_rng
+
+        if include_parameters:
+            data = param_rng.next()
+            param_exchanges = unify_param_exchanges(lca, data, param_cols)
+
+            # Update technosphere vector
+            tech_vector = update_vector(tech_vector, lca.tech_params, param_exchanges, param_cols, [0, 1])
+
+            # Update biosphere vector
+            bio_vector = update_vector(bio_vector, lca.bio_params, param_exchanges, param_cols, [2])
+
+            # Store parameter data
+            parameter_exchanges_chunk.append(param_exchanges)
+            parameters_chunk.append(param_rng.parameters.to_gsa())
+            # Extract sampled values for parameters, store.
+            param_rng.retrieve_sampled_values(parameter_data)
+
+        lca.rebuild_technosphere_matrix(tech_vector)
+        lca.rebuild_biosphere_matrix(bio_vector)
+
+        # Store matrices
+        A_matrices_chunk.append(lca.technosphere_matrix.copy())
+        B_matrices_chunk.append(lca.biosphere_matrix.copy())
+
+        if not hasattr(lca, "demand_array"):
+            lca.build_demand_array()
+        lca.lci_calculation()
+
+        # Pre-calculate CF vectors
+        cf_vectors = {}
+        for m in methods:
+            cf_vectors[m] = (cf_rngs[m].next() if include_cfs else cf_rngs[m])
+            CF_dict_chunk[m].append(cf_vectors[m])
+
+        # Iterate over functional units
+        for row, func_unit_key in rev_fu_index.items():
+            lca.redo_lci({func_unit_key: func_units_dict[func_unit_key]})
+            for col, m in rev_method_index.items():
+                lca.switch_method(m)
+                lca.rebuild_characterization_matrix(cf_vectors[m])
+                lca.lcia_calculation()
+                results_chunk[iteration, row, col] = lca.score
+
+        # Report progress
+        progress_queue.put(1)
+
+    return (results_chunk, A_matrices_chunk, B_matrices_chunk,
+            CF_dict_chunk, parameter_exchanges_chunk, parameters_chunk)
 
 class MonteCarloLCA(object):
     """A Monte Carlo LCA for multiple reference flows and methods loaded from a calculation setup."""
@@ -248,6 +395,120 @@ class MonteCarloLCA(object):
             f"Monte Carlo LCA: finished {iterations} iterations for {len(self.func_units)} reference flows and "
             f"{len(self.methods)} methods in {np.round(time() - start, 2)} seconds."
         )
+        
+    def calculate_parallelised(self, iterations=10, seed: int = None, **kwargs):
+        """Parallelised calculate method for the MC LCA class."""
+        start = time()
+
+        # Setup of the parallelisation
+        num_cores = min(cpu_count(), iterations)  # Ensure not to have more processes than iterations
+
+        # Split the iterations across multiple cores
+        iterations_per_core = iterations // num_cores
+        iterations_chunks = [iterations_per_core] * num_cores
+        for i in range(iterations % num_cores):
+            iterations_chunks[i] += 1  # Distribute remaining iterations
+
+        self.iterations = iterations
+        self.seed = seed or bc.utils.get_seed()
+        self.include_technosphere = kwargs.get("technosphere", True)
+        self.include_biosphere = kwargs.get("biosphere", True)
+        self.include_cfs = kwargs.get("cf", True)
+        self.include_parameters = kwargs.get("parameters", True)
+
+        self.load_data()
+
+        # Prepare results arrays
+        self.results = np.zeros((iterations, len(self.func_units), len(self.methods)))
+
+        # Reset GSA variables to empty.
+        self.A_matrices = []
+        self.B_matrices = []
+        self.CF_dict = defaultdict(list)
+        self.parameter_exchanges = []
+        self.parameters = []
+
+        # Prepare GSA parameter schema:
+        if self.include_parameters:
+            self.parameter_data = self.param_rng.extract_active_parameters(self.lca)
+            # Add a values field to handle all the sampled parameter values.
+            for k in self.parameter_data:
+                self.parameter_data[k]["values"] = []
+
+        # Prepare data to pass to worker functions
+        manager = Manager()
+        progress_queue = manager.Queue()
+
+        # Extract necessary data for workers
+        func_units_dict = self.func_units_dict
+        methods = self.methods
+        param_cols = self.param_cols
+
+        args_list = []
+        for iterations_chunk in iterations_chunks:
+            args = (iterations_chunk,
+                    self.seed,
+                    self.include_technosphere,
+                    self.include_biosphere,
+                    self.include_cfs,
+                    self.include_parameters,
+                    func_units_dict,
+                    methods,
+                    param_cols,
+                    progress_queue)
+            args_list.append(args)
+
+        # Protect the multiprocessing code
+        def run_multiprocessing():
+            # Use multiprocessing Pool to parallelize
+            with Pool(num_cores) as pool:
+                pool_result = pool.map_async(monte_carlo_worker, args_list)
+
+                # Update progress
+                try:
+                    from tqdm import tqdm
+                    with tqdm(total=iterations, desc="Monte Carlo Simulation") as pbar:
+                        while not pool_result.ready():
+                            while not progress_queue.empty():
+                                pbar.update(progress_queue.get())
+                except ImportError:
+                    log.warning("tqdm is not installed. Progress will not be displayed.")
+
+                pool_result = pool_result.get()
+            return pool_result
+
+        # Adjusted code to prevent child processes from re-running the main script
+        if __name__ == '__main__':
+            from multiprocessing import freeze_support
+            freeze_support()
+            pool_result = run_multiprocessing()
+        else:
+            # If not in main process, run without multiprocessing
+            pool_result = [monte_carlo_worker(args) for args in args_list]
+
+        # Combine results from all worker processes
+        iteration_counter = 0
+        for result in pool_result:
+            (results_chunk, A_matrices_chunk, B_matrices_chunk, CF_dict_chunk,
+            parameter_exchanges_chunk, parameters_chunk) = result
+
+            chunk_size = results_chunk.shape[0]
+            self.results[iteration_counter:iteration_counter + chunk_size, :, :] = results_chunk
+            iteration_counter += chunk_size
+
+            self.A_matrices.extend(A_matrices_chunk)
+            self.B_matrices.extend(B_matrices_chunk)
+            for key in CF_dict_chunk:
+                self.CF_dict[key].extend(CF_dict_chunk[key])
+            self.parameter_exchanges.extend(parameter_exchanges_chunk)
+            self.parameters.extend(parameters_chunk)
+
+        log.info(
+            f"Parallelised Monte Carlo LCA: finished {iterations} iterations for {len(self.func_units)} reference flows and "
+            f"{len(self.methods)} methods in {np.round(time() - start, 2)} seconds."
+        )
+
+
 
     @property
     def func_units_dict(self) -> dict:

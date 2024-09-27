@@ -1288,6 +1288,12 @@ class MonteCarloTab(NewAnalysisTab):
         )
         self.seed = QLineEdit("")
         self.seed.setFixedWidth(30)
+        self.parallelisation = QCheckBox("Parallelisation", self)
+        self.parallelisation.setChecked(False)
+        self.label_seed.setToolTip(
+            "Whether or not to run the Monte Carlo Simulation in a parallelised way."
+            "Depending on your machine, parallelisation can offer significant speed-up."
+        )
 
         self.hlayout_run = QHBoxLayout()
         self.hlayout_run.addWidget(self.scenario_label)
@@ -1297,6 +1303,7 @@ class MonteCarloTab(NewAnalysisTab):
         self.hlayout_run.addWidget(self.iterations)
         self.hlayout_run.addWidget(self.label_seed)
         self.hlayout_run.addWidget(self.seed)
+        self.hlayout_run.addWidget(self.parallelisation)
         self.hlayout_run.addWidget(self.include_box)
         self.hlayout_run.addStretch(1)
         layout_mc.addLayout(self.hlayout_run)
@@ -1385,7 +1392,10 @@ class MonteCarloTab(NewAnalysisTab):
 
         QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            self.parent.mc.calculate(iterations=iterations, seed=seed, **includes)
+            if not self.parallelisation.isChecked():  # perform non-parallelised MC calculation as a standard
+                self.parent.mc.calculate(iterations=iterations, seed=seed, **includes)
+            else:  # if the option checkbox to perform a parallelised MC calculation is checked, do that
+                self.parent.mc.calculate_parallelised(iterations=iterations, seed=seed, **includes)
             signals.monte_carlo_finished.emit()
             self.update_mc()
         except (

@@ -54,4 +54,7 @@ if QSysInfo.productType() in ["arch", "nixos"]:
 
 QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
 
-application = ABApplication()
+def create_application():
+    return ABApplication()
+
+
