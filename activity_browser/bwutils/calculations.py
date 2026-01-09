@@ -4,9 +4,12 @@ from logging import getLogger
 from bw2calc.errors import BW2CalcError
 from PySide2.QtWidgets import QApplication
 
-from ..bwutils import (MLCA, Contributions, MonteCarloLCA,
+from ..bwutils import (MLCA, Contributions, # MonteCarloLCA,
                        SuperstructureContributions, SuperstructureMLCA)
 from .errors import CriticalCalculationError, ScenarioExchangeNotFoundError
+
+from activity_browser.mod import bw2data as bd
+from uncertainty_lca import MonteCarloLCA
 
 log = getLogger(__name__)
 
@@ -55,6 +58,9 @@ def do_LCA_calculations(data: dict):
         raise ValueError
 
     mlca.calculate()
-    mc = MonteCarloLCA(cs_name)
+    
+    demand = bd.calculation_setups[cs_name]["inv"][0] # todo: for now, this only works for the first functional unit due to the [0]
+    methods = bd.calculation_setups[cs_name]["ia"]
+    mc = MonteCarloLCA(demand, lcia_methods=methods)
 
     return mlca, contributions, mc

@@ -1709,7 +1709,7 @@ class MonteCarloTab(NewAnalysisTab):
         super(MonteCarloTab, self).__init__(parent)
         self.parent: LCAResultsSubTab = parent
         header_ = QToolBar()
-        _header = header("Monte Carlo Simulation")
+        _header = header("Monte Carlo Simulation | powered by MOCA")
         _header.setToolTip("Left click on the question mark for help")
         header_.addWidget(_header)
         header_.addAction(
@@ -1893,7 +1893,8 @@ class MonteCarloTab(NewAnalysisTab):
 
         QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            self.parent.mc.calculate(iterations=iterations, seed=seed, **includes)
+            # self.parent.mc.calculate(iterations=iterations, seed=seed, **includes)
+            self.parent.mc.execute_serial_monte_carlo(iterations=iterations)
             signals.monte_carlo_finished.emit()
             self.update_mc()
         except (
@@ -1966,9 +1967,9 @@ class MonteCarloTab(NewAnalysisTab):
 
     def update_tab(self):
         self.update_combobox(
-            self.combobox_methods, [str(m) for m in self.parent.mc.methods]
+            self.combobox_methods, [str(m) for m in self.parent.mc.lcia_methods]
         )
-        # self.update_combobox(self.combobox_methods, [str(m) for m in self.parent.mct.mc.methods])
+        # self.update_combobox(self.combobox_methods, [str(m) for m in self.parent.mct.mc.lcia_methods])
 
     def update_mc(self, cs_name=None):
         # act = self.combobox_fu.currentText()
@@ -1982,7 +1983,7 @@ class MonteCarloTab(NewAnalysisTab):
         self.export_widget.show()
 
         method_index = self.combobox_methods.currentIndex()
-        method = self.parent.mc.methods[method_index]
+        method = self.parent.mc.lcia_methods[method_index]
 
         # data = self.parent.mc.get_results_by(act_key=act_key, method=method)
         self.df = self.parent.mc.get_results_dataframe(method=method)
@@ -2146,7 +2147,7 @@ class GSATab(NewAnalysisTab):
 
     def update_tab(self):
         self.update_combobox(
-            self.combobox_methods, [str(m) for m in self.parent.mc.methods]
+            self.combobox_methods, [str(m) for m in self.parent.mc.lcia_methods]
         )
         self.update_combobox(
             self.combobox_fu, list(self.parent.mlca.func_unit_translation_dict.keys())
@@ -2254,7 +2255,7 @@ class MonteCarloWorkerThread(QtCore.QThread):
 
     def run(self):
         log.info(f"Starting new Worker Thread. Iterations: {self.iterations}")
-        self.mc.calculate(iterations=self.iterations)
+        self.mc.execute_serial_monte_carlo(iterations=self.iterations)
         # res = bw.GraphTraversal().calculate(self.demand, self.method, self.cutoff, self.max_calc)
         log.info("in thread {}".format(QtCore.QThread.currentThread()))
         signals.monte_carlo_ready.emit(self.mc.cs_name)

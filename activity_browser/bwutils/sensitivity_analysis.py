@@ -18,7 +18,8 @@ from SALib.analyze import delta
 from activity_browser.mod import bw2data as bd
 
 from ..settings import ab_settings
-from .montecarlo import MonteCarloLCA, perform_MonteCarlo_LCA
+
+from uncertainty_lca import MonteCarloLCA
 
 try:
     # attempt bw25 import
