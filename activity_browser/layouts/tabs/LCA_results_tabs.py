@@ -12,6 +12,12 @@ from logging import getLogger
 import numpy as np
 import pandas as pd
 
+import os
+import tempfile
+import sys
+import json
+import pickle
+
 from PySide2 import QtCore, QtGui
 from PySide2.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
                                QComboBox, QFileDialog, QGridLayout, QGroupBox,
@@ -1894,9 +1900,45 @@ class MonteCarloTab(NewAnalysisTab):
         QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
             # self.parent.mc.calculate(iterations=iterations, seed=seed, **includes)
-            self.parent.mc.execute_serial_monte_carlo(iterations=iterations)
-            signals.monte_carlo_finished.emit()
-            self.update_mc()
+            
+            demand_json = json.dumps(self.parent.mc.demand_act)
+            lcia_json = json.dumps([list(m) for m in self.parent.mc.lcia_methods])
+            
+            self.sub_process = QtCore.QProcess(self)  # keep it alive for the lifetime of the tab
+            self.sub_process.finished.connect(self._on_mc_finished)
+            self.sub_process.readyReadStandardOutput.connect(self._on_mc_stdout)
+            self.sub_process.readyReadStandardError.connect(self._on_mc_stderr)
+            
+            self.mc_output_file = os.path.join(
+                tempfile.gettempdir(),
+                "mc_lca_results.pkl"
+            )
+            
+            max_cores = min(os.cpu_count(), 60)
+            num_cores = max_cores - 1  # leave one core free for the GUI
+            
+            args = [
+                "-m", "uncertainty_lca.run",
+                "--iterations", str(iterations),
+                "--bw_project", bd.projects.current,
+                "--demand", demand_json,
+                "--lcia_methods", lcia_json,
+                "--output", self.mc_output_file,
+                "--num_cores", str(num_cores),
+            ]
+            
+            log.info(
+                "Monte Carlo subprocess started via module uncertainty_lca.run"
+            )
+            log.debug(
+                "Subprocess command: %s %s",
+                sys.executable,
+                " ".join(args),
+            )
+            self.sub_process.start(sys.executable, args)  # use same Python as the GUI
+            
+            # self.parent.mc.execute_parallel_monte_carlo(iterations=iterations)
+            # self.update_mc()
         except (
             InvalidParamsError
         ) as e:  # This can occur if uncertainty data is missing or otherwise broken
@@ -1905,61 +1947,40 @@ class MonteCarloTab(NewAnalysisTab):
             QMessageBox.warning(
                 self, "Could not perform Monte Carlo simulation", str(e)
             )
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _on_mc_finished(self, exit_code, exit_status):
         QApplication.restoreOverrideCursor()
+        if exit_code == 0:
+            log.info("Monte Carlo subprocess finished successfully.")
+            
+            try:
+                with open(self.mc_output_file, "rb") as f:
+                    self.parent.mc._mc_results = pickle.load(f)
+                signals.monte_carlo_finished.emit()
+                self.update_mc()
+            except Exception as e:
+                log.error("Failed to load Monte Carlo results", exc_info=e)
+                QMessageBox.warning(self, "Error", f"Failed to load results: {e}")
+            
+        else:
+            log.error(f"Monte Carlo subprocess failed with exit code {exit_code}")
+            QMessageBox.critical(
+                self,
+                "Monte Carlo failed",
+                f"The Monte Carlo subprocess terminated with an error (exit code {exit_code})."
+            )
 
-        # a threaded way for this - unfortunatley this crashes as:
-        # pypardsio_solver is used for the 'spsolve' and 'factorized' functions. Python crashes on windows if multiple
-        # instances of PyPardisoSolver make calls to the Pardiso library
-        # worker_thread = WorkerThread()
-        # print('Created local worker_thread')
-        # worker_thread.set_mc(self.parent.mc, iterations=iterations)
-        # print('Passed object to thread.')
-        # worker_thread.start()
-        # self.label_running.show()
+    def _on_mc_stdout(self):
+        text = self.sub_process.readAllStandardOutput().data().decode()
+        if text.strip():
+            log.info(text)
 
-        #
-
-        # thread = NewCSMCThread() #self.parent.mc
-        # thread.calculation_finished.connect(
-        #     lambda x: print('Calculation finished.'))
-        # thread.start()
-
-        # # give us a thread and start it
-        # thread = QtCore.QThread()
-        # thread.start()
-        #
-        # # create a worker and move it to our extra thread
-        # worker = Worker()
-        # worker.moveToThread(thread)
-
-        # self.parent.mct.start()
-        # self.parent.mct.run(iterations=iterations)
-        # self.parent.mct.finished()
-
-        # objThread = QtCore.QThread()
-        # obj = QObjectMC()  # self.parent.cs_name
-        # obj.moveToThread(objThread)
-        # obj.finished.connect(objThread.quit)
-        # objThread.started.connect(obj.long_running)
-        # # objThread.finished.connect(app.exit)
-        # objThread.finished.connect(
-        #     lambda x: print('Finished Thread!')
-        # )
-        # objThread.start()
-
-        # objThread = QtCore.QThread()
-        # obj = SomeObject()
-        # obj.moveToThread(objThread)
-        # obj.finished.connect(objThread.quit)
-        # objThread.started.connect(obj.long_running)
-        # objThread.finished.connect(
-        #     lambda x: print('Finished Thread!')
-        # )
-        # objThread.start()
-
-        # self.method_selection_widget.show()
-        # self.plot.show()
-        # self.export_widget.show()
+    def _on_mc_stderr(self):
+        text = self.sub_process.readAllStandardError().data().decode()
+        if text.strip():
+            log.error(text)
 
     def configure_scenario(self):
         super().configure_scenario()
@@ -2154,6 +2175,7 @@ class GSATab(NewAnalysisTab):
         )
 
     def monte_carlo_finished(self):
+        QApplication.restoreOverrideCursor()
         self.button_run.setEnabled(True)
         self.widget_settings.show()
         self.label_monte_carlo_first.hide()
@@ -2238,50 +2260,3 @@ class GSATab(NewAnalysisTab):
     #         optional.get("functional_unit"), self.unit
     #     )
     #     filename = '_'.join((str(x) for x in fields if x is not None))
-
-
-class MonteCarloWorkerThread(QtCore.QThread):
-    """A worker for Monte Carlo simulations.
-
-    Unfortunately, pyparadiso does not allow parallel calculations on Windows (crashes).
-    So this is for future reference in case this issue is solved..."""
-
-    def __init__(self):
-        pass
-
-    def set_mc(self, mc, iterations=20):
-        self.mc = mc
-        self.iterations = iterations
-
-    def run(self):
-        log.info(f"Starting new Worker Thread. Iterations: {self.iterations}")
-        self.mc.execute_serial_monte_carlo(iterations=self.iterations)
-        # res = bw.GraphTraversal().calculate(self.demand, self.method, self.cutoff, self.max_calc)
-        log.info("in thread {}".format(QtCore.QThread.currentThread()))
-        signals.monte_carlo_ready.emit(self.mc.cs_name)
-
-
-worker_thread = MonteCarloWorkerThread()
-
-# TODO review if can be removed
-
-# class Worker(QtCore.QObject):
-#
-#     def __init__(self):
-#         super().__init__()
-#
-#     def do_something(self, text):
-#         print('in thread {} message {}'.format(QtCore.QThread.currentThread(), text))
-#
-#
-# class SomeObject(QtCore.QObject):
-#
-#     finished = QtCore.pyqtSignal()
-#
-#     def long_running(self):
-#         count = 0
-#         while count < 5:
-#             time.sleep(1)
-#             print("B Increasing")
-#             count += 1
-#         self.finished.emit()
