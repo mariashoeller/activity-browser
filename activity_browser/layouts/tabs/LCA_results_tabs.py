@@ -1802,6 +1802,28 @@ class MonteCarloTab(NewAnalysisTab):
         )
         self.seed = QLineEdit("")
         self.seed.setFixedWidth(30)
+        
+        self.parallel_box = QGroupBox("Parallelisation setup:", self)
+        grid_parallel = QGridLayout()
+        self.run_parallel = QCheckBox("Run in parallel", self)
+        self.run_parallel.setChecked(True)
+        self.num_cores = QLineEdit(str(max(os.cpu_count() - 1, 1)))
+        self.num_cores.setFixedWidth(40)
+        self.num_cores.setValidator(QtGui.QIntValidator(1, 60))
+        self.label_num_cores = QLabel("Limit number of CPU cores:")
+        self.label_num_cores.setToolTip(
+            "Limit the number of CPU cores that are used for multiprocessing. "
+            "Per default, one core is kept free to keep the GUI responsive."
+        )       
+        grid_parallel.addWidget(self.run_parallel, 0, 0)
+        grid_parallel.addWidget(self.label_num_cores, 1, 0)
+        grid_parallel.addWidget(self.num_cores, 1, 1)
+        self.parallel_box.setLayout(grid_parallel)
+        
+        self.num_cores.setEnabled(self.run_parallel.isChecked())
+        self.label_num_cores.setEnabled(self.run_parallel.isChecked())
+        self.run_parallel.toggled.connect(self.num_cores.setEnabled)
+        self.run_parallel.toggled.connect(self.label_num_cores.setEnabled)
 
         self.hlayout_run = QHBoxLayout()
         self.hlayout_run.addWidget(self.scenario_label)
@@ -1811,6 +1833,7 @@ class MonteCarloTab(NewAnalysisTab):
         self.hlayout_run.addWidget(self.iterations)
         self.hlayout_run.addWidget(self.label_seed)
         self.hlayout_run.addWidget(self.seed)
+        self.hlayout_run.addWidget(self.parallel_box)
         self.hlayout_run.addWidget(self.include_box)
         self.hlayout_run.addStretch(1)
         layout_mc.addLayout(self.hlayout_run)
@@ -1915,7 +1938,10 @@ class MonteCarloTab(NewAnalysisTab):
             )
             
             max_cores = min(os.cpu_count(), 60)
-            num_cores = max_cores - 1  # leave one core free for the GUI
+            default_num_cores = max_cores - 1  # leave one core free for the GUI
+            
+            # if the user want to use a lower number of cores, do that
+            num_cores = min(default_num_cores, int(self.num_cores.text()))
             
             args = [
                 "-m", "uncertainty_lca.run",
@@ -1925,6 +1951,7 @@ class MonteCarloTab(NewAnalysisTab):
                 "--lcia_methods", lcia_json,
                 "--output", self.mc_output_file,
                 "--num_cores", str(num_cores),
+                "--run_parallel", str(self.run_parallel.isChecked())
             ]
             
             log.info(
