@@ -17,6 +17,7 @@ import tempfile
 import sys
 import json
 import pickle
+import re
 
 from PySide2 import QtCore, QtGui
 from PySide2.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
@@ -24,7 +25,7 @@ from PySide2.QtWidgets import (QApplication, QButtonGroup, QCheckBox,
                                QHBoxLayout, QLabel, QLineEdit, QMessageBox,
                                QPushButton, QRadioButton, QScrollArea,
                                QTableView, QTabWidget, QToolBar, QVBoxLayout,
-                               QWidget)
+                               QWidget, QProgressBar)
 
 from activity_browser.bwutils import AB_metadata
 
@@ -1863,6 +1864,13 @@ class MonteCarloTab(NewAnalysisTab):
         # self.hlayout_fu.addWidget(self.combobox_fu)
         # self.hlayout_fu.addStretch()
         # self.layout_mc.addLayout(self.hlayout_fu)
+        
+        # progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout_mc.addWidget(self.progress_bar)
+        self.progress_bar.hide()  # hide until simulation starts
 
         # method selection
         self.method_selection_widget = QWidget()
@@ -1944,7 +1952,7 @@ class MonteCarloTab(NewAnalysisTab):
             num_cores = min(default_num_cores, int(self.num_cores.text()))
             
             args = [
-                "-m", "uncertainty_lca.run",
+                "-u", "-m", "uncertainty_lca.run",
                 "--iterations", str(iterations),
                 "--bw_project", bd.projects.current,
                 "--demand", demand_json,
@@ -1953,6 +1961,9 @@ class MonteCarloTab(NewAnalysisTab):
                 "--num_cores", str(num_cores),
                 "--run_parallel", str(self.run_parallel.isChecked())
             ]
+            
+            self.progress_bar.setValue(0)
+            self.progress_bar.show()
             
             log.info(
                 "Monte Carlo subprocess started via module uncertainty_lca.run"
@@ -1977,9 +1988,10 @@ class MonteCarloTab(NewAnalysisTab):
         finally:
             QApplication.restoreOverrideCursor()
 
-    def _on_mc_finished(self, exit_code, exit_status):
+    def _on_mc_finished(self, exit_code):
         QApplication.restoreOverrideCursor()
         if exit_code == 0:
+            self.progress_bar.hide()
             log.info("Monte Carlo subprocess finished successfully.")
             
             try:
@@ -2000,14 +2012,53 @@ class MonteCarloTab(NewAnalysisTab):
             )
 
     def _on_mc_stdout(self):
-        text = self.sub_process.readAllStandardOutput().data().decode()
-        if text.strip():
-            log.info(text)
+        """Process stdout from Monte Carlo subprocess."""
+        data = self.sub_process.readAllStandardOutput().data().decode('utf-8', errors='replace')
+        if not data:
+            return
+        
+        # Split by both \n and \r to handle tqdm output
+        lines = data.replace('\r', '\n').split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Log informational messages
+            if "Running Monte Carlo" in line or "Results written" in line:
+                log.info(line)
+            
+            # Extract progress percentage - matches "X%" or "X%|"
+            match = re.search(r'(\d+)%', line)
+            if match:
+                perc = int(match.group(1))
+                self.progress_bar.setValue(perc)
+
 
     def _on_mc_stderr(self):
-        text = self.sub_process.readAllStandardError().data().decode()
-        if text.strip():
-            log.error(text)
+        """Process stderr from Monte Carlo subprocess."""
+        data = self.sub_process.readAllStandardError().data().decode('utf-8', errors='replace')
+        if not data:
+            return
+        
+        # tqdm writes to stderr by default, so check for progress there
+        lines = data.replace('\r', '\n').split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check if this is a progress update from tqdm
+            match = re.search(r'(\d+)%', line)
+            if match:
+                perc = int(match.group(1))
+                self.progress_bar.setValue(perc)
+            else:
+                # Only log actual errors (not empty tqdm lines)
+                if line and '|' not in line:  # Skip tqdm progress bars
+                    log.error(f"MC stderr: {line}")
 
     def configure_scenario(self):
         super().configure_scenario()
